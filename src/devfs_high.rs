@@ -22,7 +22,7 @@ type ReaddirRImpl = esp_vfs_t__bindgen_ty_15;
 
 pub struct DirHandle {
     ptr: NonNull<DIR>,
-    iter: IntoIter<dirent>,
+    iter: IntoIter<u16>,
 }
 
 #[derive(Debug)]
@@ -55,15 +55,8 @@ impl DevFs {
     pub(crate) fn opendir(&mut self, path: PathBuf) -> NonNull<DIR> {
         log::info!("Opening directory: {}", path.display());
 
-        let new_handle_id = self
-            .dirhandles
-            .last()
-            .map_or(1, |handle| unsafe { handle.ptr.as_ref() }.dd_vfs_idx + 1);
-
-        log::info!("opendir(): creating new handle with index {new_handle_id}");
-
         let handle = Box::new(DIR {
-            dd_vfs_idx: new_handle_id,
+            dd_vfs_idx: 0, // managed by ESP-IDF
             dd_rsv: 0,
         });
 
@@ -71,7 +64,7 @@ impl DevFs {
 
         self.dirhandles.push(DirHandle {
             ptr: handleptr,
-            iter: self.content.clone().into_iter(),
+            iter: self.create_dir_iterator(),
         });
         handleptr
     }
@@ -81,8 +74,6 @@ impl DevFs {
         let olen = self.dirhandles.len();
 
         log::info!("closedir(handle={handle_index}): deleting handle");
-
-        dbg!(&self.dirhandles);
         self.dirhandles
             .retain(|candidate| candidate.idx() != handle_index);
 
@@ -98,6 +89,73 @@ impl DevFs {
         Ok(())
     }
 
+    pub(crate) fn readdir_r(
+        &mut self,
+        dir: NonNull<DIR>,
+        mut entry: NonNull<dirent>,
+        out_dirent: NonNull<*mut dirent>,
+    ) -> Result<(), io::Error> {
+        let dir_handle = unsafe { dir.as_ref() };
+
+        log::info!(
+            "readdir_r(handle={}): iterating directory contents",
+            dir_handle.dd_vfs_idx
+        );
+
+        let Some(handle) = self
+            .dirhandles
+            .iter_mut()
+            .find(|candidate| candidate.idx() == dir_handle.dd_vfs_idx)
+        else {
+            log::error!(
+                "readdir_r(handle={}): illegal handle",
+                dir_handle.dd_vfs_idx
+            );
+            return Err(io::Error::other("illegal handle"));
+        };
+
+        let Some(next_item) = handle.iter.next() else {
+            log::info!(
+                "readdir_r(handle={}): reached end of iterator",
+                dir_handle.dd_vfs_idx
+            );
+
+            unsafe { *out_dirent.as_ptr() = ptr::null_mut() };
+
+            return Ok(());
+        };
+
+        log::info!(
+            "readdir_r(handle={}): continuing iteration",
+            dir_handle.dd_vfs_idx
+        );
+
+        let next_entry = self.find_file_by_inode(next_item).unwrap();
+
+        unsafe {
+            entry.as_mut().d_ino = next_entry.d_ino;
+            entry.as_mut().d_type = next_entry.d_type;
+            entry.as_mut().d_name = next_entry.d_name;
+
+            let out_dirent_ptr = out_dirent.as_ptr();
+
+            (*out_dirent_ptr) = entry.as_mut();
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::needless_collect)]
+    fn create_dir_iterator(&self) -> IntoIter<u16> {
+        let inodes: Vec<u16> = self.content.iter().map(|entry| entry.d_ino).collect();
+        inodes.into_iter()
+    }
+
+    fn find_file_by_inode(&self, inode: u16) -> Option<&dirent> {
+        self.content
+            .iter()
+            .find(|candidate| candidate.d_ino == inode)
+    }
+
     fn create_vfs_config() -> esp_vfs_t {
         esp_vfs_t {
             flags: unsafe { i32::try_from(ESP_VFS_FLAG_DEFAULT).unwrap_unchecked() },
@@ -106,6 +164,9 @@ impl DevFs {
             },
             __bindgen_anon_18: CloseDirImpl {
                 closedir: Some(Self::_vfs_closedir),
+            },
+            __bindgen_anon_15: ReaddirRImpl {
+                readdir_r: Some(Self::_vfs_readdir_r),
             },
             ..Default::default()
         }
@@ -127,6 +188,22 @@ impl DevFs {
 
         let value = DEVFS.lock().unwrap().closedir(dirptr);
         match value {
+            Ok(()) => 0,
+            Err(why) => why.raw_os_error().unwrap_or(-1),
+        }
+    }
+
+    unsafe extern "C" fn _vfs_readdir_r(
+        dir: *mut DIR,
+        entry: *mut dirent,
+        result: *mut *mut dirent,
+    ) -> i32 {
+        let dirptr = NonNull::new(dir).unwrap();
+        let entryptr = NonNull::new(entry).unwrap();
+        let resultptr = NonNull::new(result).unwrap();
+
+        let error = DEVFS.lock().unwrap().readdir_r(dirptr, entryptr, resultptr);
+        match error {
             Ok(()) => 0,
             Err(why) => why.raw_os_error().unwrap_or(-1),
         }
