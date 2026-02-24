@@ -6,7 +6,6 @@
 use std::fs;
 
 mod devfs;
-mod devfs_high;
 
 fn main() {
     esp_idf_svc::sys::link_patches();
@@ -15,7 +14,7 @@ fn main() {
     log::info!("Hello, world!");
 
     log::info!("Registering devfs");
-    devfs_high::setup();
+    devfs::setup();
 
     let files = fs::read_dir("/dev");
 
