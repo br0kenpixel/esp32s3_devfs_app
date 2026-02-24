@@ -1,5 +1,5 @@
 [package]
-name = "socktest"
+name = "esp32s3_devfs"
 version = "0.1.0"
 authors = ["br0kenpixel <23280129+br0kenpixel@users.noreply.github.com>"]
 edition = "2021"
@@ -7,7 +7,7 @@ resolver = "2"
 rust-version = "1.77"
 
 [[bin]]
-name = "socktest"
+name = "esp32s3_devfs"
 harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
 
 [profile.release]
