@@ -44,7 +44,37 @@ impl DevFs {
         self.content.push(dirent {
             d_ino: 1,
             d_type: FILETYPE_REGULAR,
-            d_name: filename("test"),
+            d_name: filename("null"),
+        });
+
+        self.content.push(dirent {
+            d_ino: 2,
+            d_type: FILETYPE_REGULAR,
+            d_name: filename("zero"),
+        });
+
+        self.content.push(dirent {
+            d_ino: 3,
+            d_type: FILETYPE_REGULAR,
+            d_name: filename("random"),
+        });
+
+        self.content.push(dirent {
+            d_ino: 4,
+            d_type: FILETYPE_REGULAR,
+            d_name: filename("urandom"),
+        });
+
+        self.content.push(dirent {
+            d_ino: 5,
+            d_type: FILETYPE_REGULAR,
+            d_name: filename("stdout"),
+        });
+
+        self.content.push(dirent {
+            d_ino: 6,
+            d_type: FILETYPE_REGULAR,
+            d_name: filename("stderr"),
         });
 
         let config = Self::create_vfs_config();
@@ -126,12 +156,12 @@ impl DevFs {
             return Ok(());
         };
 
+        let next_entry = self.find_file_by_inode(next_item).unwrap();
+
         log::info!(
-            "readdir_r(handle={}): continuing iteration",
+            "readdir_r(handle={}): continuing iteration: {next_item}",
             dir_handle.dd_vfs_idx
         );
-
-        let next_entry = self.find_file_by_inode(next_item).unwrap();
 
         unsafe {
             entry.as_mut().d_ino = next_entry.d_ino;
