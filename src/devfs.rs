@@ -1,11 +1,13 @@
 use esp_idf_svc::sys::{
     dirent, esp_vfs_register, esp_vfs_t, esp_vfs_t__bindgen_ty_13, esp_vfs_t__bindgen_ty_15,
-    esp_vfs_t__bindgen_ty_18, EspError, DIR, DT_REG, ESP_VFS_FLAG_DEFAULT,
+    esp_vfs_t__bindgen_ty_18, esp_vfs_t__bindgen_ty_6, EspError, DIR, DT_REG, ESP_VFS_FLAG_DEFAULT,
+    O_APPEND, O_CLOEXEC, O_CREAT, O_DIRECT, O_DIRECTORY, O_EXCL, O_EXEC, O_NOCTTY, O_NOFOLLOW,
+    O_NONBLOCK, O_RDONLY, O_RDWR, O_SYNC, O_TRUNC, O_WRONLY,
 };
 use std::{
     ffi::{CStr, CString},
     fmt, io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr::{self, NonNull},
     str::FromStr,
     sync::Mutex,
@@ -20,6 +22,36 @@ static DEVFS: Mutex<DevFs> = Mutex::new(DevFs::new());
 type OpenDirImpl = esp_vfs_t__bindgen_ty_13;
 type CloseDirImpl = esp_vfs_t__bindgen_ty_18;
 type ReaddirRImpl = esp_vfs_t__bindgen_ty_15;
+type OpenImpl = esp_vfs_t__bindgen_ty_6;
+
+macro_rules! err_unsupported_operation {
+    () => {
+        std::io::Error::new(std::io::ErrorKind::Unsupported, "unsupported operation")
+    };
+
+    ($message: literal) => {
+        std::io::Error::new(std::io::ErrorKind::Unsupported, $message)
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenFlags {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+    Append,
+    Create,
+    Truncate,
+    Exclusive,
+    Sync,
+    NonBlock,
+    NoControlTty,
+    CloseOnExec,
+    NoFollow,
+    Directory,
+    Exec,
+    Direct,
+}
 
 pub struct DirHandle {
     ptr: NonNull<DIR>,
@@ -175,6 +207,42 @@ impl DevFs {
         Ok(())
     }
 
+    pub(crate) fn open(
+        &self,
+        path: &PathBuf,
+        flags: &[OpenFlags],
+        mode: u32,
+    ) -> Result<(), io::Error> {
+        log::info!(
+            "open(path='{}', flags={flags:?}, mode={mode}): called",
+            path.display()
+        );
+
+        if mode != 0 {
+            log::warn!("Mode is not zero: {flags:?}");
+        }
+
+        let entry = self
+            .find_file_by_path(path)
+            .ok_or_else(|| std::io::Error::new(io::ErrorKind::NotFound, "no such file"))?;
+
+        match b_filename(&entry.d_name) {
+            "null" => {
+                if !flags.contains(&OpenFlags::ReadOnly) {
+                    return Err(err_unsupported_operation!("O_RDONLY flag is required"));
+                }
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "unsupported open for file",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     #[allow(clippy::needless_collect)]
     fn create_dir_iterator(&self) -> IntoIter<u16> {
         let inodes: Vec<u16> = self.content.iter().map(|entry| entry.d_ino).collect();
@@ -185,6 +253,14 @@ impl DevFs {
         self.content
             .iter()
             .find(|candidate| candidate.d_ino == inode)
+    }
+
+    fn find_file_by_path(&self, path: &Path) -> Option<&dirent> {
+        let filename_bytes = path.file_name()?.to_string_lossy();
+        let filename_str = filename(filename_bytes);
+        self.content
+            .iter()
+            .find(|candidate| candidate.d_name == filename_str)
     }
 
     fn create_vfs_config() -> esp_vfs_t {
@@ -198,6 +274,9 @@ impl DevFs {
             },
             __bindgen_anon_15: ReaddirRImpl {
                 readdir_r: Some(Self::_vfs_readdir_r),
+            },
+            __bindgen_anon_6: OpenImpl {
+                open: Some(Self::_vfs_open),
             },
             ..Default::default()
         }
@@ -234,10 +313,20 @@ impl DevFs {
         let resultptr = NonNull::new(result).unwrap();
 
         let error = DEVFS.lock().unwrap().readdir_r(dirptr, entryptr, resultptr);
-        match error {
-            Ok(()) => 0,
-            Err(why) => why.raw_os_error().unwrap_or(-1),
-        }
+        error.map_or_else(|err| err.raw_os_error().unwrap_or(-1), |()| 0)
+    }
+
+    unsafe extern "C" fn _vfs_open(path: *const u8, flags: i32, mode: i32) -> i32 {
+        let path_str = CStr::from_ptr(path);
+        let hpath = PathBuf::from_str(path_str.to_str().unwrap()).unwrap();
+        let flags = OpenFlags::parse_all(flags);
+
+        let error = DEVFS
+            .lock()
+            .unwrap()
+            .open(&hpath, &flags, u32::try_from(mode).unwrap());
+
+        error.map_or_else(|err| err.raw_os_error().unwrap_or(-1), |()| 0)
     }
 }
 
@@ -255,8 +344,121 @@ fn filename<S: AsRef<str>>(name: S) -> [u8; 256] {
     result
 }
 
+fn b_filename(raw_name: &[u8; 256]) -> &str {
+    std::str::from_utf8(raw_name).unwrap()
+}
+
 pub fn setup() {
     DEVFS.lock().unwrap().setup();
+}
+
+impl OpenFlags {
+    const RAW_FLAGS: &[u32] = &[
+        O_APPEND,
+        O_CLOEXEC,
+        O_CREAT,
+        O_DIRECT,
+        O_DIRECTORY,
+        O_EXCL,
+        O_EXEC,
+        O_NOCTTY,
+        O_NOFOLLOW,
+        O_NONBLOCK,
+        O_RDONLY,
+        O_RDWR,
+        O_SYNC,
+        O_TRUNC,
+        O_WRONLY,
+    ];
+
+    pub fn parse_all(value: i32) -> Box<[Self]> {
+        let mut flags = Vec::new();
+        let value = u32::try_from(value).unwrap();
+
+        for flag in Self::RAW_FLAGS {
+            if (value & *flag) > 0 {
+                flags.push(OpenFlags::try_from(*flag).unwrap());
+            }
+        }
+
+        flags.into_boxed_slice()
+    }
+}
+
+impl TryFrom<i32> for OpenFlags {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match u32::try_from(value).map_err(|_| ())? {
+            O_RDONLY => Ok(Self::ReadOnly),
+            O_WRONLY => Ok(Self::WriteOnly),
+            O_RDWR => Ok(Self::ReadWrite),
+            O_APPEND => Ok(Self::Append),
+            O_CREAT => Ok(Self::Create),
+            O_TRUNC => Ok(Self::Truncate),
+            O_EXCL => Ok(Self::Exclusive),
+            O_SYNC => Ok(Self::Sync),
+            O_NONBLOCK => Ok(Self::NonBlock),
+            O_NOCTTY => Ok(Self::NoControlTty),
+            O_CLOEXEC => Ok(Self::CloseOnExec),
+            O_NOFOLLOW => Ok(Self::NoFollow),
+            O_DIRECTORY => Ok(Self::Directory),
+            O_EXEC => Ok(Self::Exec),
+            O_DIRECT => Ok(Self::Direct),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<u32> for OpenFlags {
+    type Error = ();
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            O_RDONLY => Ok(Self::ReadOnly),
+            O_WRONLY => Ok(Self::WriteOnly),
+            O_RDWR => Ok(Self::ReadWrite),
+            O_APPEND => Ok(Self::Append),
+            O_CREAT => Ok(Self::Create),
+            O_TRUNC => Ok(Self::Truncate),
+            O_EXCL => Ok(Self::Exclusive),
+            O_SYNC => Ok(Self::Sync),
+            O_NONBLOCK => Ok(Self::NonBlock),
+            O_NOCTTY => Ok(Self::NoControlTty),
+            O_CLOEXEC => Ok(Self::CloseOnExec),
+            O_NOFOLLOW => Ok(Self::NoFollow),
+            O_DIRECTORY => Ok(Self::Directory),
+            O_EXEC => Ok(Self::Exec),
+            O_DIRECT => Ok(Self::Direct),
+            _ => Err(()),
+        }
+    }
+}
+
+impl fmt::Display for OpenFlags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::ReadOnly => "O_RDONLY",
+                Self::WriteOnly => "O_WRONLY",
+                Self::ReadWrite => "O_RDWR",
+                Self::Append => "O_APPEND",
+                Self::Create => "O_CREAT",
+                Self::Truncate => "O_TRUNC",
+                Self::Exclusive => "O_EXCL",
+                Self::Sync => "O_SYNC",
+                Self::NonBlock => "O_NONBLOCK",
+                Self::NoControlTty => "O_NOCTTY",
+                Self::CloseOnExec => "O_CLOEXEC",
+                Self::NoFollow => "O_NOFOLLOW",
+                Self::Directory => "O_DIRECTORY",
+                Self::Exec => "O_EXEC",
+                Self::Direct => "O_DIRECT",
+            }
+        )
+    }
 }
 
 impl DirHandle {

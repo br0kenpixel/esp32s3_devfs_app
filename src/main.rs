@@ -16,6 +16,25 @@ fn main() {
     log::info!("Registering devfs");
     devfs::setup();
 
+    list_devices();
+
+    null_device();
+}
+
+fn null_device() {
+    let file = fs::OpenOptions::new().read(true).open("/dev/null");
+
+    match file {
+        Ok(file) => {
+            todo!()
+        }
+        Err(why) => {
+            log::error!("Failed to open /dev/null: {why}");
+        }
+    }
+}
+
+fn list_devices() {
     let files = fs::read_dir("/dev");
 
     match files {
